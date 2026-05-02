@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { cleanPlateText, chooseBestPlateText } from "../../../lib/plate-utils";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 30;
 
 type OcrSpaceParsedResult = {
   ParsedText?: string;
@@ -17,9 +17,20 @@ type OcrSpaceResponse = {
   ErrorDetails?: string;
 };
 
+function stripDataUrl(image: string): string {
+  const marker = "base64,";
+  const idx = image.indexOf(marker);
+  return idx >= 0 ? image.slice(idx + marker.length) : image;
+}
+
 function asDataUrl(image: string): string {
   if (image.startsWith("data:")) return image;
   return `data:image/jpeg;base64,${image}`;
+}
+
+function approximateBase64Bytes(base64OrDataUrl: string): number {
+  const cleaned = stripDataUrl(base64OrDataUrl).replace(/\s/g, "");
+  return Math.floor((cleaned.length * 3) / 4);
 }
 
 function normalizeErrorMessage(message: unknown): string {
@@ -31,6 +42,7 @@ function normalizeErrorMessage(message: unknown): string {
 async function callOcrSpace(imageBase64: string, engine: string): Promise<{ rawText: string; cleanText: string; raw: OcrSpaceResponse }> {
   const apiKey = process.env.OCR_SPACE_API_KEY;
   const language = process.env.OCR_SPACE_LANGUAGE ?? "eng";
+  const timeoutMs = Number(process.env.OCR_SPACE_TIMEOUT_MS ?? "15000");
 
   if (!apiKey) {
     throw new Error("Missing OCR_SPACE_API_KEY environment variable.");
@@ -43,13 +55,27 @@ async function callOcrSpace(imageBase64: string, engine: string): Promise<{ rawT
   form.append("OCREngine", engine);
   form.append("isOverlayRequired", "false");
   form.append("scale", "true");
-  form.append("detectOrientation", "true");
+  form.append("detectOrientation", "false");
   form.append("isTable", "false");
 
-  const response = await fetch("https://api.ocr.space/parse/image", {
-    method: "POST",
-    body: form
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response: Response;
+  try {
+    response = await fetch("https://api.ocr.space/parse/image", {
+      method: "POST",
+      body: form,
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`OCR.space did not respond within ${Math.round(timeoutMs / 1000)} seconds.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 
   const raw = (await response.json().catch(() => null)) as OcrSpaceResponse | null;
 
@@ -80,6 +106,22 @@ export async function POST(request: NextRequest) {
     const images = body.imagesBase64?.length ? body.imagesBase64 : body.imageBase64 ? [body.imageBase64] : [];
     if (images.length === 0) {
       return NextResponse.json({ ok: false, error: "Missing imageBase64 or imagesBase64." }, { status: 400 });
+    }
+
+    const maxOcrImageBytes = Number(process.env.MAX_OCR_IMAGE_BYTES ?? "650000");
+    for (const image of images) {
+      const bytes = approximateBase64Bytes(image);
+      if (bytes > maxOcrImageBytes) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error: `OCR crop is too large (${Math.round(bytes / 1024)} KB). Try a smaller source image.`,
+            bytes,
+            maxOcrImageBytes
+          },
+          { status: 413 }
+        );
+      }
     }
 
     // Keep this small because the free OCR.space quota is limited.

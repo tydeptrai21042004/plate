@@ -1,21 +1,54 @@
-# Free API License Plate Reader for Vercel
+# ALPR Vercel Webcam App
 
-This is a Vercel-ready **Next.js** website for license plate detection and OCR.
+Next.js app for API-based license plate recognition:
 
-It uses:
+- Roboflow Workflow API for license-plate detection
+- OCR.space API for plate OCR
+- Image upload input
+- Webcam capture input
+- Before / After side-by-side result
+- No local `.pt` model weight
 
-- **Roboflow Workflow API** for license plate detection
-- **OCR.space API** for OCR
-- **Image upload** from user computer
-- **Webcam capture** from browser camera
-- **Before / After preview** side by side
-- **No local `.pt` weight** and no Python model server
+## Important Roboflow fix
 
-API keys are used only inside Next.js API routes, so they are not exposed to browser JavaScript.
+Use this workflow URL:
 
----
+```env
+ROBOFLOW_WORKFLOW_URL=https://serverless.roboflow.com/dang-ba-ty/workflows/detect-count-and-visualize
+```
 
-## 1. Local setup
+Do **not** use the older `detect-and-classify` workflow if it still contains the broken `classification_model` step. That workflow calls `car-colors-1smyc/5` and can return:
+
+```text
+Service misconfiguration
+500 Server Error
+classification_model
+```
+
+This project parses the working response shape you pasted:
+
+```json
+[
+  {
+    "output_image": { "type": "base64", "value": "..." },
+    "predictions": {
+      "image": { "width": 439, "height": 325 },
+      "predictions": [
+        {
+          "x": 213.5,
+          "y": 232,
+          "width": 113,
+          "height": 30,
+          "confidence": 0.8647,
+          "class": "License_Plate"
+        }
+      ]
+    }
+  }
+]
+```
+
+## Local setup
 
 ```bash
 npm install
@@ -29,129 +62,40 @@ Open:
 http://localhost:3000
 ```
 
----
-
-## 2. Example `.env.local`
-
-Create `.env.local` in the project root:
+## Example `.env.local`
 
 ```env
-# Roboflow Workflow API
-# Keep this server-side only. Do NOT use NEXT_PUBLIC_ for this key.
 ROBOFLOW_API_KEY=your_roboflow_api_key_here
-ROBOFLOW_WORKFLOW_URL=https://serverless.roboflow.com/dang-ba-ty/workflows/detect-and-classify
+ROBOFLOW_WORKFLOW_URL=https://serverless.roboflow.com/dang-ba-ty/workflows/detect-count-and-visualize
 ROBOFLOW_MIN_CONFIDENCE=0.03
+ROBOFLOW_TIMEOUT_MS=18000
+MAX_API_IMAGE_BYTES=900000
 
-# OCR.space API
-# Keep this server-side only. Do NOT use NEXT_PUBLIC_ for this key.
 OCR_SPACE_API_KEY=your_ocr_space_api_key_here
 OCR_SPACE_ENGINE=2
 OCR_SPACE_LANGUAGE=eng
+OCR_SPACE_TIMEOUT_MS=15000
+MAX_OCR_IMAGE_BYTES=650000
 
-# Debug option. Keep false in production.
 RETURN_RAW_ROBOFLOW=false
 ```
 
-### Important
-
-Do **not** paste real API keys into frontend files like `app/page.tsx`. Put them only in `.env.local` locally and in Vercel Environment Variables after deployment.
-
----
-
-## 3. Deploy to Vercel
+## Vercel deploy
 
 1. Push this folder to GitHub.
-2. Go to Vercel and import your repository.
-3. Open **Project Settings → Environment Variables**.
-4. Add these variables:
+2. Import the repo into Vercel.
+3. Add the environment variables from `.env.example`.
+4. Redeploy.
+
+## If `/api/detect` returns 504
+
+Try smaller images or lower these values:
 
 ```env
-ROBOFLOW_API_KEY=your_roboflow_api_key_here
-ROBOFLOW_WORKFLOW_URL=https://serverless.roboflow.com/dang-ba-ty/workflows/detect-and-classify
-ROBOFLOW_MIN_CONFIDENCE=0.03
-OCR_SPACE_API_KEY=your_ocr_space_api_key_here
-OCR_SPACE_ENGINE=2
-OCR_SPACE_LANGUAGE=eng
-RETURN_RAW_ROBOFLOW=false
+ROBOFLOW_TIMEOUT_MS=12000
+MAX_API_IMAGE_BYTES=600000
 ```
 
-5. Click **Deploy**.
+## Security note
 
----
-
-## 4. How the website works
-
-```text
-User uploads image OR captures webcam frame
-→ Browser compresses image to JPEG
-→ /api/detect calls Roboflow Workflow with base64 image
-→ Browser crops detected plate region
-→ /api/ocr calls OCR.space with the cropped plate
-→ Browser draws box + OCR text
-→ UI shows Before and After side by side
-```
-
----
-
-## 5. Two-line Vietnamese plates
-
-The UI includes **Use two-line plate OCR crop**. When enabled, the app sends three OCR crops:
-
-```text
-full plate crop
-top half crop
-bottom half crop
-```
-
-This helps with Vietnamese motorbike plates such as:
-
-```text
-90-B2
-452.30
-```
-
----
-
-## 6. Troubleshooting
-
-### No plate detected
-
-Try lowering confidence in the UI to:
-
-```text
-0.01
-```
-
-Or set this in `.env.local` / Vercel:
-
-```env
-ROBOFLOW_MIN_CONFIDENCE=0.01
-```
-
-### OCR reads only one line
-
-Enable:
-
-```text
-Use two-line plate OCR crop
-```
-
-Then try OCR Engine `1`, `2`, and `3`.
-
-### Webcam does not work
-
-Camera access requires HTTPS. Vercel deployments use HTTPS. Localhost also works in most browsers.
-
-### Roboflow response has no detections
-
-Set this temporarily:
-
-```env
-RETURN_RAW_ROBOFLOW=true
-```
-
-Then check the `/api/detect` response in the browser Network tab. After debugging, set it back to:
-
-```env
-RETURN_RAW_ROBOFLOW=false
-```
+Do not put API keys in frontend code. This app keeps keys inside server-side API routes. If you pasted real keys publicly, rotate/regenerate them before deployment.

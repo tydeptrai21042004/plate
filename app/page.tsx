@@ -6,6 +6,7 @@ import type { PlateDetection } from "../lib/plate-utils";
 type DetectionResponse = {
   ok: boolean;
   detections?: PlateDetection[];
+  outputImageDataUrl?: string | null;
   error?: string;
   detail?: unknown;
 };
@@ -34,7 +35,7 @@ function loadImage(src: string): Promise<HTMLImageElement> {
   });
 }
 
-async function resizeImageDataUrl(src: string, maxSide = 1280, quality = 0.82): Promise<string> {
+async function resizeImageDataUrl(src: string, maxSide = 900, quality = 0.72): Promise<string> {
   const img = await loadImage(src);
   const scale = Math.min(1, maxSide / Math.max(img.naturalWidth, img.naturalHeight));
   const width = Math.max(1, Math.round(img.naturalWidth * scale));
@@ -48,6 +49,61 @@ async function resizeImageDataUrl(src: string, maxSide = 1280, quality = 0.82): 
 
   ctx.drawImage(img, 0, 0, width, height);
   return canvas.toDataURL("image/jpeg", quality);
+}
+
+function estimateDataUrlBytes(dataUrl: string): number {
+  const marker = "base64,";
+  const idx = dataUrl.indexOf(marker);
+  const base64 = idx >= 0 ? dataUrl.slice(idx + marker.length) : dataUrl;
+  return Math.floor((base64.replace(/\s/g, "").length * 3) / 4);
+}
+
+async function compressForFreeApis(src: string): Promise<string> {
+  // Vercel + free OCR APIs are much more stable with sub-1MB images.
+  // Try several sizes/qualities until the image is small enough.
+  const targets = [
+    { maxSide: 900, quality: 0.72 },
+    { maxSide: 768, quality: 0.68 },
+    { maxSide: 640, quality: 0.62 },
+    { maxSide: 512, quality: 0.58 }
+  ];
+
+  let best = await resizeImageDataUrl(src, targets[0].maxSide, targets[0].quality);
+  for (const target of targets) {
+    best = await resizeImageDataUrl(src, target.maxSide, target.quality);
+    if (estimateDataUrlBytes(best) <= 850_000) return best;
+  }
+  return best;
+}
+
+async function fetchJsonWithTimeout<T>(url: string, body: unknown, timeoutMs = 28_000): Promise<{ response: Response; json: T }> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+
+    const text = await response.text();
+    let json: T;
+    try {
+      json = text ? (JSON.parse(text) as T) : ({} as T);
+    } catch {
+      json = { ok: false, error: text || `Non-JSON response from ${url}` } as T;
+    }
+
+    return { response, json };
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`${url} timed out after ${Math.round(timeoutMs / 1000)} seconds. Try a smaller/clearer image or test again.`);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timer);
+  }
 }
 
 function fileToDataUrl(file: File): Promise<string> {
@@ -213,12 +269,12 @@ export default function Home() {
     }
 
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const compressed = await resizeImageDataUrl(canvas.toDataURL("image/jpeg", 0.9));
+    const compressed = await compressForFreeApis(canvas.toDataURL("image/jpeg", 0.9));
     setImageDataUrl(compressed);
     setAnnotatedDataUrl("");
     setDetections([]);
     setResults([]);
-    setStatus("Captured camera image. Click Detect + OCR.");
+    setStatus(`Captured camera image (${Math.round(estimateDataUrlBytes(compressed) / 1024)} KB). Click Detect + OCR.`);
   }
 
   async function handleFile(file: File | null) {
@@ -227,12 +283,12 @@ export default function Home() {
     setStatus("Loading image...");
     try {
       const raw = await fileToDataUrl(file);
-      const compressed = await resizeImageDataUrl(raw);
+      const compressed = await compressForFreeApis(raw);
       setImageDataUrl(compressed);
       setAnnotatedDataUrl("");
       setDetections([]);
       setResults([]);
-      setStatus("Image ready. Click Detect + OCR.");
+      setStatus(`Image ready (${Math.round(estimateDataUrlBytes(compressed) / 1024)} KB). Click Detect + OCR.`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load image.");
     }
@@ -249,23 +305,30 @@ export default function Home() {
     setResults([]);
 
     try {
-      const detectResponse = await fetch("/api/detect", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ imageBase64: imageDataUrl, confidence })
-      });
+      const apiImage = await compressForFreeApis(imageDataUrl);
+      if (apiImage !== imageDataUrl) setImageDataUrl(apiImage);
+      setStatus(`Detecting license plate with Roboflow (${Math.round(estimateDataUrlBytes(apiImage) / 1024)} KB image)...`);
 
-      const detectJson = (await detectResponse.json()) as DetectionResponse;
+      const { response: detectResponse, json: detectJson } = await fetchJsonWithTimeout<DetectionResponse>(
+        "/api/detect",
+        { imageBase64: apiImage, confidence },
+        28_000
+      );
+
       if (!detectResponse.ok || !detectJson.ok) {
-        throw new Error(detectJson.error || "Detection failed.");
+        throw new Error(detectJson.error || `Detection failed with status ${detectResponse.status}.`);
       }
 
+      const srcForProcessing = apiImage;
       const found = (detectJson.detections ?? []).slice(0, 3);
       setDetections(found);
+      if (detectJson.outputImageDataUrl) {
+        setAnnotatedDataUrl(detectJson.outputImageDataUrl);
+      }
 
       if (found.length === 0) {
         setStatus("No plate detected. Try lowering confidence or using a clearer image.");
-        setAnnotatedDataUrl(await drawAnnotatedImage(imageDataUrl, [], []));
+        setAnnotatedDataUrl(detectJson.outputImageDataUrl || (await drawAnnotatedImage(srcForProcessing, [], [])));
         return;
       }
 
@@ -274,23 +337,22 @@ export default function Home() {
         const det = found[i];
         setStatus(`OCR.space reading plate ${i + 1}/${found.length}...`);
 
-        const fullCrop = await cropImageDataUrl(imageDataUrl, det.bbox, 0.14, "full");
+        const fullCrop = await cropImageDataUrl(srcForProcessing, det.bbox, 0.14, "full");
         const images = [fullCrop];
 
         if (twoLineOcr) {
-          images.push(await cropImageDataUrl(imageDataUrl, det.bbox, 0.14, "top"));
-          images.push(await cropImageDataUrl(imageDataUrl, det.bbox, 0.14, "bottom"));
+          images.push(await cropImageDataUrl(srcForProcessing, det.bbox, 0.14, "top"));
+          images.push(await cropImageDataUrl(srcForProcessing, det.bbox, 0.14, "bottom"));
         }
 
-        const ocrResponse = await fetch("/api/ocr", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ imagesBase64: images, engine: ocrEngine })
-        });
+        const { response: ocrResponse, json: ocrJson } = await fetchJsonWithTimeout<OcrResponse>(
+          "/api/ocr",
+          { imagesBase64: images, engine: ocrEngine },
+          24_000
+        );
 
-        const ocrJson = (await ocrResponse.json()) as OcrResponse;
         if (!ocrResponse.ok || !ocrJson.ok) {
-          throw new Error(ocrJson.error || "OCR failed.");
+          throw new Error(ocrJson.error || `OCR failed with status ${ocrResponse.status}.`);
         }
 
         const candidates = ocrJson.candidates ?? [];
@@ -307,7 +369,7 @@ export default function Home() {
       }
 
       setResults(plateResults);
-      setAnnotatedDataUrl(await drawAnnotatedImage(imageDataUrl, plateResults, found));
+      setAnnotatedDataUrl(await drawAnnotatedImage(srcForProcessing, plateResults, found));
       setStatus("Done.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown error.");
