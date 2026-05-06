@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PlateDetection } from "../lib/plate-utils";
+import { chooseBestPlateText, cleanPlateText, compactPlateText } from "../lib/plate-utils";
 
 type DetectionResponse = {
   ok: boolean;
@@ -24,6 +25,25 @@ type PlateResult = {
   text: string;
   candidates: string[];
   cropDataUrl: string;
+};
+
+type Registry = Record<string, string>;
+type GateAction = "IN" | "OUT";
+
+type SerialPortLike = {
+  readable: ReadableStream<Uint8Array> | null;
+  writable: WritableStream<Uint8Array> | null;
+  open: (options: { baudRate: number }) => Promise<void>;
+  close?: () => Promise<void>;
+};
+
+const REGISTRY_KEY = "parkingPlateRegistry.v1";
+
+const DEFAULT_REGISTRY: Registry = {
+  // Demo cards. Replace/add your real RFID UID from the Arduino message.
+  "DEMO30F": "30F",
+  "DEMO55F": "55F",
+  "DEMO75": "75"
 };
 
 function loadImage(src: string): Promise<HTMLImageElement> {
@@ -59,8 +79,6 @@ function estimateDataUrlBytes(dataUrl: string): number {
 }
 
 async function compressForFreeApis(src: string): Promise<string> {
-  // Vercel + free OCR APIs are much more stable with sub-1MB images.
-  // Try several sizes/qualities until the image is small enough.
   const targets = [
     { maxSide: 900, quality: 0.72 },
     { maxSide: 768, quality: 0.68 },
@@ -192,17 +210,10 @@ async function drawAnnotatedImage(src: string, results: PlateResult[], detection
 }
 
 function combineTwoLineText(fullText: string, topText: string, bottomText: string): string {
-  const clean = (value: string) =>
-    value
-      .toUpperCase()
-      .replace(/[^A-Z0-9.\- ]+/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
-
-  const full = clean(fullText);
-  const top = clean(topText);
-  const bottom = clean(bottomText);
-  const combined = clean(`${top} ${bottom}`);
+  const full = cleanPlateText(fullText);
+  const top = cleanPlateText(topText);
+  const bottom = cleanPlateText(bottomText);
+  const combined = cleanPlateText(`${top} ${bottom}`);
 
   const fullCompactLength = full.replace(/\s/g, "").length;
   const combinedCompactLength = combined.replace(/\s/g, "").length;
@@ -211,9 +222,50 @@ function combineTwoLineText(fullText: string, topText: string, bottomText: strin
   return full || combined;
 }
 
+function normalizeUid(uid: string): string {
+  return uid.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function normalizePlate(value: string): string {
+  return compactPlateText(value).replace(/[.\-]/g, "");
+}
+
+function isPlateMatch(detectedPlate: string, savedPlate: string): boolean {
+  const detected = normalizePlate(detectedPlate);
+  const saved = normalizePlate(savedPlate);
+
+  if (!detected || !saved) return false;
+
+  // For testing with short province/prefix values like 30F, 55F, 75.
+  if (saved.length <= 3) return detected.startsWith(saved);
+
+  return detected === saved;
+}
+
+function loadRegistryFromStorage(): Registry {
+  if (typeof window === "undefined") return DEFAULT_REGISTRY;
+
+  try {
+    const raw = window.localStorage.getItem(REGISTRY_KEY);
+    if (!raw) return DEFAULT_REGISTRY;
+    return { ...DEFAULT_REGISTRY, ...(JSON.parse(raw) as Registry) };
+  } catch {
+    return DEFAULT_REGISTRY;
+  }
+}
+
+function saveRegistryToStorage(registry: Registry) {
+  window.localStorage.setItem(REGISTRY_KEY, JSON.stringify(registry, null, 2));
+}
+
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const portRef = useRef<SerialPortLike | null>(null);
+  const writerRef = useRef<WritableStreamDefaultWriter<Uint8Array> | null>(null);
+  const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
+  const registryRef = useRef<Registry>(DEFAULT_REGISTRY);
+
   const [cameraActive, setCameraActive] = useState(false);
   const [imageDataUrl, setImageDataUrl] = useState<string>("");
   const [annotatedDataUrl, setAnnotatedDataUrl] = useState<string>("");
@@ -226,7 +278,27 @@ export default function Home() {
   const [twoLineOcr, setTwoLineOcr] = useState(true);
   const [ocrEngine, setOcrEngine] = useState("2");
 
+  const [serialConnected, setSerialConnected] = useState(false);
+  const [lastArduinoLine, setLastArduinoLine] = useState("none");
+  const [pendingUid, setPendingUid] = useState("");
+  const [pendingAction, setPendingAction] = useState<GateAction | "">("");
+  const [registry, setRegistry] = useState<Registry>(DEFAULT_REGISTRY);
+  const [registerUid, setRegisterUid] = useState("");
+  const [registerPlate, setRegisterPlate] = useState("30F");
+  const [lastDecision, setLastDecision] = useState("No RFID scan yet.");
+
   const canRun = useMemo(() => Boolean(imageDataUrl) && !busy, [imageDataUrl, busy]);
+  const savedPlateForPendingUid = pendingUid ? registry[normalizeUid(pendingUid)] ?? "" : "";
+
+  useEffect(() => {
+    const loaded = loadRegistryFromStorage();
+    registryRef.current = loaded;
+    setRegistry(loaded);
+  }, []);
+
+  useEffect(() => {
+    registryRef.current = registry;
+  }, [registry]);
 
   const stopCamera = useCallback(() => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -234,7 +306,21 @@ export default function Home() {
     setCameraActive(false);
   }, []);
 
-  useEffect(() => () => stopCamera(), [stopCamera]);
+  useEffect(() => {
+    return () => {
+      stopCamera();
+      try {
+        readerRef.current?.cancel();
+      } catch {
+        // Ignore cleanup errors.
+      }
+      try {
+        writerRef.current?.releaseLock();
+      } catch {
+        // Ignore cleanup errors.
+      }
+    };
+  }, [stopCamera]);
 
   async function startCamera() {
     setError("");
@@ -246,35 +332,40 @@ export default function Home() {
       streamRef.current = stream;
       if (videoRef.current) videoRef.current.srcObject = stream;
       setCameraActive(true);
+      setStatus("Webcam started. Now connect Arduino and scan RFID.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not start camera.");
     }
   }
 
-  async function captureFromCamera() {
-    setError("");
+  async function captureFrameDataUrl(): Promise<string> {
     const video = videoRef.current;
     if (!video || video.videoWidth === 0 || video.videoHeight === 0) {
-      setError("Camera is not ready yet.");
-      return;
+      throw new Error("Camera is not ready. Click Start webcam first.");
     }
 
     const canvas = document.createElement("canvas");
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     const ctx = canvas.getContext("2d");
-    if (!ctx) {
-      setError("Could not capture camera frame.");
-      return;
-    }
+    if (!ctx) throw new Error("Could not capture camera frame.");
 
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const compressed = await compressForFreeApis(canvas.toDataURL("image/jpeg", 0.9));
-    setImageDataUrl(compressed);
-    setAnnotatedDataUrl("");
-    setDetections([]);
-    setResults([]);
-    setStatus(`Captured camera image (${Math.round(estimateDataUrlBytes(compressed) / 1024)} KB). Click Detect + OCR.`);
+    return compressForFreeApis(canvas.toDataURL("image/jpeg", 0.9));
+  }
+
+  async function captureFromCamera() {
+    setError("");
+    try {
+      const compressed = await captureFrameDataUrl();
+      setImageDataUrl(compressed);
+      setAnnotatedDataUrl("");
+      setDetections([]);
+      setResults([]);
+      setStatus(`Captured camera image (${Math.round(estimateDataUrlBytes(compressed) / 1024)} KB). Click Detect + OCR.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not capture camera frame.");
+    }
   }
 
   async function handleFile(file: File | null) {
@@ -294,83 +385,85 @@ export default function Home() {
     }
   }
 
+  async function detectPlatesFromImage(inputImageDataUrl: string, maxResults = 3): Promise<PlateResult[]> {
+    const apiImage = await compressForFreeApis(inputImageDataUrl);
+    if (apiImage !== imageDataUrl) setImageDataUrl(apiImage);
+
+    setStatus(`Detecting license plate (${Math.round(estimateDataUrlBytes(apiImage) / 1024)} KB image)...`);
+
+    const { response: detectResponse, json: detectJson } = await fetchJsonWithTimeout<DetectionResponse>(
+      "/api/detect",
+      { imageBase64: apiImage, confidence },
+      28_000
+    );
+
+    if (!detectResponse.ok || !detectJson.ok) {
+      throw new Error(detectJson.error || `Detection failed with status ${detectResponse.status}.`);
+    }
+
+    const found = (detectJson.detections ?? []).slice(0, maxResults);
+    setDetections(found);
+    if (detectJson.outputImageDataUrl) setAnnotatedDataUrl(detectJson.outputImageDataUrl);
+
+    if (found.length === 0) {
+      setAnnotatedDataUrl(detectJson.outputImageDataUrl || (await drawAnnotatedImage(apiImage, [], [])));
+      return [];
+    }
+
+    const plateResults: PlateResult[] = [];
+    for (let i = 0; i < found.length; i += 1) {
+      const det = found[i];
+      setStatus(`OCR reading plate ${i + 1}/${found.length}...`);
+
+      const fullCrop = await cropImageDataUrl(apiImage, det.bbox, 0.14, "full");
+      const images = [fullCrop];
+
+      if (twoLineOcr) {
+        images.push(await cropImageDataUrl(apiImage, det.bbox, 0.14, "top"));
+        images.push(await cropImageDataUrl(apiImage, det.bbox, 0.14, "bottom"));
+      }
+
+      const { response: ocrResponse, json: ocrJson } = await fetchJsonWithTimeout<OcrResponse>(
+        "/api/ocr",
+        { imagesBase64: images, engine: ocrEngine },
+        24_000
+      );
+
+      if (!ocrResponse.ok || !ocrJson.ok) {
+        throw new Error(ocrJson.error || `OCR failed with status ${ocrResponse.status}.`);
+      }
+
+      const candidates = ocrJson.candidates ?? [];
+      const chosenText = twoLineOcr
+        ? combineTwoLineText(candidates[0] ?? ocrJson.text ?? "", candidates[1] ?? "", candidates[2] ?? "")
+        : chooseBestPlateText([ocrJson.text ?? "", ...candidates]);
+
+      plateResults.push({
+        detection: det,
+        text: chosenText || "NO_TEXT",
+        candidates,
+        cropDataUrl: fullCrop
+      });
+    }
+
+    setResults(plateResults);
+    setAnnotatedDataUrl(await drawAnnotatedImage(apiImage, plateResults, found));
+    return plateResults;
+  }
+
   async function runDetectionAndOcr() {
     if (!imageDataUrl) return;
 
     setBusy(true);
     setError("");
-    setStatus("Detecting license plate with Roboflow...");
+    setStatus("Detecting license plate...");
     setAnnotatedDataUrl("");
     setDetections([]);
     setResults([]);
 
     try {
-      const apiImage = await compressForFreeApis(imageDataUrl);
-      if (apiImage !== imageDataUrl) setImageDataUrl(apiImage);
-      setStatus(`Detecting license plate with Roboflow (${Math.round(estimateDataUrlBytes(apiImage) / 1024)} KB image)...`);
-
-      const { response: detectResponse, json: detectJson } = await fetchJsonWithTimeout<DetectionResponse>(
-        "/api/detect",
-        { imageBase64: apiImage, confidence },
-        28_000
-      );
-
-      if (!detectResponse.ok || !detectJson.ok) {
-        throw new Error(detectJson.error || `Detection failed with status ${detectResponse.status}.`);
-      }
-
-      const srcForProcessing = apiImage;
-      const found = (detectJson.detections ?? []).slice(0, 3);
-      setDetections(found);
-      if (detectJson.outputImageDataUrl) {
-        setAnnotatedDataUrl(detectJson.outputImageDataUrl);
-      }
-
-      if (found.length === 0) {
-        setStatus("No plate detected. Try lowering confidence or using a clearer image.");
-        setAnnotatedDataUrl(detectJson.outputImageDataUrl || (await drawAnnotatedImage(srcForProcessing, [], [])));
-        return;
-      }
-
-      const plateResults: PlateResult[] = [];
-      for (let i = 0; i < found.length; i += 1) {
-        const det = found[i];
-        setStatus(`OCR.space reading plate ${i + 1}/${found.length}...`);
-
-        const fullCrop = await cropImageDataUrl(srcForProcessing, det.bbox, 0.14, "full");
-        const images = [fullCrop];
-
-        if (twoLineOcr) {
-          images.push(await cropImageDataUrl(srcForProcessing, det.bbox, 0.14, "top"));
-          images.push(await cropImageDataUrl(srcForProcessing, det.bbox, 0.14, "bottom"));
-        }
-
-        const { response: ocrResponse, json: ocrJson } = await fetchJsonWithTimeout<OcrResponse>(
-          "/api/ocr",
-          { imagesBase64: images, engine: ocrEngine },
-          24_000
-        );
-
-        if (!ocrResponse.ok || !ocrJson.ok) {
-          throw new Error(ocrJson.error || `OCR failed with status ${ocrResponse.status}.`);
-        }
-
-        const candidates = ocrJson.candidates ?? [];
-        const chosenText = twoLineOcr
-          ? combineTwoLineText(candidates[0] ?? ocrJson.text ?? "", candidates[1] ?? "", candidates[2] ?? "")
-          : ocrJson.text ?? "";
-
-        plateResults.push({
-          detection: det,
-          text: chosenText || "NO_TEXT",
-          candidates,
-          cropDataUrl: fullCrop
-        });
-      }
-
-      setResults(plateResults);
-      setAnnotatedDataUrl(await drawAnnotatedImage(srcForProcessing, plateResults, found));
-      setStatus("Done.");
+      const plateResults = await detectPlatesFromImage(imageDataUrl, 3);
+      setStatus(plateResults.length > 0 ? "Done." : "No plate detected. Try a clearer image or lower confidence.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown error.");
       setStatus("");
@@ -379,39 +472,298 @@ export default function Home() {
     }
   }
 
+  async function connectArduino() {
+    setError("");
+    try {
+      const serial = (navigator as Navigator & { serial?: { requestPort: () => Promise<SerialPortLike> } }).serial;
+      if (!serial) {
+        throw new Error("Web Serial is not available. Use Chrome or Edge at http://localhost:3000.");
+      }
+
+      const port = await serial.requestPort();
+      await port.open({ baudRate: 9600 });
+      portRef.current = port;
+
+      if (!port.writable) throw new Error("Selected serial port is not writable.");
+      writerRef.current = port.writable.getWriter();
+
+      setSerialConnected(true);
+      setStatus("Arduino connected. Start webcam, then scan RFID.");
+      void readArduinoLoop(port);
+    } catch (err) {
+      setSerialConnected(false);
+      setError(err instanceof Error ? err.message : "Could not connect Arduino.");
+    }
+  }
+
+  async function disconnectArduino() {
+    try {
+      await readerRef.current?.cancel();
+    } catch {
+      // Ignore.
+    }
+    try {
+      writerRef.current?.releaseLock();
+    } catch {
+      // Ignore.
+    }
+    writerRef.current = null;
+
+    try {
+      await portRef.current?.close?.();
+    } catch {
+      // Ignore.
+    }
+    portRef.current = null;
+    setSerialConnected(false);
+    setStatus("Arduino disconnected.");
+  }
+
+  async function readArduinoLoop(port: SerialPortLike) {
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    try {
+      while (port.readable) {
+        const reader = port.readable.getReader();
+        readerRef.current = reader;
+
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (!value) continue;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() ?? "";
+
+            for (const rawLine of lines) {
+              const line = rawLine.trim();
+              if (line) void handleArduinoLine(line);
+            }
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      }
+    } catch (err) {
+      setSerialConnected(false);
+      if (err instanceof Error && err.name !== "AbortError") {
+        setError(err.message);
+      }
+    }
+  }
+
+  async function sendToArduino(command: string) {
+    if (!writerRef.current) throw new Error("Arduino is not connected.");
+    const encoder = new TextEncoder();
+    await writerRef.current.write(encoder.encode(`${command}\n`));
+  }
+
+  async function handleArduinoLine(line: string) {
+    setLastArduinoLine(line);
+
+    const parts = line.split(",").map((item) => item.trim());
+    if (parts[0] !== "RFID") return;
+
+    const action = parts[1] as GateAction;
+    const uid = normalizeUid(parts[2] ?? "");
+    if (!uid || (action !== "IN" && action !== "OUT")) return;
+
+    setPendingUid(uid);
+    setPendingAction(action);
+    setRegisterUid(uid);
+
+    const savedPlate = registryRef.current[uid] ?? "";
+    if (!savedPlate) {
+      setLastDecision(`UID ${uid} is not registered. Save a plate first.`);
+      await sendToArduino(`DENY,${uid},UID_NOT_FOUND`);
+      return;
+    }
+
+    await processGateCheck(uid, action, savedPlate);
+  }
+
+  async function processGateCheck(uid: string, action: GateAction, savedPlate: string) {
+    setBusy(true);
+    setError("");
+    setAnnotatedDataUrl("");
+    setDetections([]);
+    setResults([]);
+
+    try {
+      setStatus(`RFID ${uid} detected. Capturing webcam image...`);
+      const captured = await captureFrameDataUrl();
+      setImageDataUrl(captured);
+
+      const plateResults = await detectPlatesFromImage(captured, 1);
+      if (plateResults.length === 0) {
+        await sendToArduino(`DENY,${uid},NO_PLATE`);
+        setLastDecision(`DENY: UID=${uid}. No plate detected.`);
+        setStatus("No plate detected. Gate denied.");
+        return;
+      }
+
+      const detectedPlate = plateResults[0].text;
+      const accepted = isPlateMatch(detectedPlate, savedPlate);
+
+      if (accepted) {
+        const command = action === "IN" ? "OPEN_IN" : "OPEN_OUT";
+        await sendToArduino(`${command},${uid},${normalizePlate(detectedPlate) || detectedPlate}`);
+        setLastDecision(`OPEN_${action}: UID=${uid}. Saved=${savedPlate}. Detected=${detectedPlate}.`);
+        setStatus(`Access accepted. Saved=${savedPlate}, Detected=${detectedPlate}.`);
+      } else {
+        await sendToArduino(`DENY,${uid},WRONG_PLATE`);
+        setLastDecision(`DENY: UID=${uid}. Saved=${savedPlate}. Detected=${detectedPlate}.`);
+        setStatus(`Access denied. Saved=${savedPlate}, Detected=${detectedPlate}.`);
+      }
+    } catch (err) {
+      try {
+        await sendToArduino(`DENY,${uid},AI_ERROR`);
+      } catch {
+        // Ignore nested serial errors.
+      }
+      setLastDecision(`DENY: UID=${uid}. AI/webcam error.`);
+      setError(err instanceof Error ? err.message : "AI check failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function savePlateForUid(uidInput = registerUid, plateInput = registerPlate) {
+    const uid = normalizeUid(uidInput);
+    const plate = normalizePlate(plateInput);
+
+    if (!uid) {
+      setError("Please scan or enter an RFID UID first.");
+      return;
+    }
+    if (!plate) {
+      setError("Please enter a plate number.");
+      return;
+    }
+
+    const nextRegistry = { ...registry, [uid]: plate };
+    registryRef.current = nextRegistry;
+    registryRef.current = nextRegistry;
+    setRegistry(nextRegistry);
+    saveRegistryToStorage(nextRegistry);
+    setRegisterUid(uid);
+    setRegisterPlate(plate);
+    setError("");
+    setStatus(`Saved: UID ${uid} → plate ${plate}`);
+  }
+
+  function removePlateForUid(uid: string) {
+    const normalizedUid = normalizeUid(uid);
+    const nextRegistry = { ...registry };
+    delete nextRegistry[normalizedUid];
+    setRegistry(nextRegistry);
+    saveRegistryToStorage(nextRegistry);
+    setStatus(`Removed UID ${normalizedUid}.`);
+  }
+
   return (
     <main className="page-shell">
       <section className="hero-card">
         <div>
-          <p className="eyebrow">Roboflow detection + OCR.space OCR</p>
-          <h1>Free API License Plate Reader</h1>
+          <p className="eyebrow">Arduino RFID + Webcam AI</p>
+          <h1>Parking Gate Plate Checker</h1>
           <p className="hero-text">
-            Choose an image from your computer or capture one from the webcam. The app shows the
-            original image and the annotated output side by side, while API keys stay protected in
-            Vercel server routes.
+            Scan an RFID card, capture the webcam image, detect the plate, compare it with the saved plate for that UID, then send OPEN or DENY back to Arduino.
           </p>
         </div>
-        <div className="badge">Vercel-ready • No local .pt model</div>
+        <div className="badge">USB Serial • Local browser • AI API</div>
+      </section>
+
+      <section className="panel gate-panel">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Gate mode</p>
+            <h2>Arduino connection and RFID registry</h2>
+          </div>
+          <p className="muted no-margin">Close Arduino Serial Monitor before connecting here.</p>
+        </div>
+
+        <div className="gate-grid">
+          <article className="mini-card">
+            <h3>1. Connect hardware</h3>
+            <div className="button-row">
+              <button type="button" onClick={connectArduino} disabled={serialConnected}>
+                {serialConnected ? "Arduino connected" : "Connect Arduino"}
+              </button>
+              <button type="button" className="secondary" onClick={disconnectArduino} disabled={!serialConnected}>
+                Disconnect
+              </button>
+            </div>
+            <p className="muted">Serial: {serialConnected ? "Connected" : "Not connected"}</p>
+            <p className="muted">Last line: {lastArduinoLine}</p>
+          </article>
+
+          <article className="mini-card">
+            <h3>2. Save card plate</h3>
+            <label>
+              RFID UID
+              <input value={registerUid} onChange={(event) => setRegisterUid(normalizeUid(event.target.value))} placeholder="Scan card or type UID" />
+            </label>
+            <label>
+              Plate number
+              <input value={registerPlate} onChange={(event) => setRegisterPlate(event.target.value.toUpperCase())} placeholder="Example: 30F, 55F, 75" />
+            </label>
+            <div className="quick-buttons">
+              {["30F", "55F", "75"].map((plate) => (
+                <button type="button" className="secondary" key={plate} onClick={() => setRegisterPlate(plate)}>
+                  {plate}
+                </button>
+              ))}
+            </div>
+            <button type="button" className="primary" onClick={() => savePlateForUid()}>
+              Save UID → Plate
+            </button>
+          </article>
+
+          <article className="mini-card decision-card">
+            <h3>3. Current check</h3>
+            <p><strong>Pending UID:</strong> {pendingUid || "None"}</p>
+            <p><strong>Action:</strong> {pendingAction || "None"}</p>
+            <p><strong>Saved plate:</strong> {savedPlateForPendingUid || "None"}</p>
+            <p className="decision-text">{lastDecision}</p>
+          </article>
+        </div>
+
+        <div className="registry-list">
+          <h3>Saved plates</h3>
+          {Object.keys(registry).length === 0 ? (
+            <p className="muted">No saved plates yet.</p>
+          ) : (
+            <div className="registry-table">
+              {Object.entries(registry).map(([uid, plate]) => (
+                <div className="registry-row" key={uid}>
+                  <code>{uid}</code>
+                  <strong>{plate}</strong>
+                  <button type="button" className="secondary" onClick={() => removePlateForUid(uid)}>Remove</button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </section>
 
       <section className="panel input-panel">
         <div className="section-heading">
           <div>
-            <p className="eyebrow">Step 1</p>
-            <h2>Choose input source</h2>
+            <p className="eyebrow">Image input</p>
+            <h2>Webcam or manual image test</h2>
           </div>
-          <p className="muted no-margin">Upload an existing image or capture directly from the user webcam.</p>
+          <p className="muted no-margin">For gate mode, start webcam first, then scan RFID.</p>
         </div>
 
         <div className="input-options">
           <label className="file-box input-card">
-            <input
-              type="file"
-              accept="image/*"
-              onChange={(event) => handleFile(event.target.files?.[0] ?? null)}
-            />
+            <input type="file" accept="image/*" onChange={(event) => handleFile(event.target.files?.[0] ?? null)} />
             <span>Upload image</span>
-            <small>JPG / PNG / WebP. Large images are compressed before API calls.</small>
+            <small>Manual testing only. JPG / PNG / WebP.</small>
           </label>
 
           <div className="camera-box input-card">
@@ -435,14 +787,7 @@ export default function Home() {
         <div className="settings action-settings">
           <label>
             Detection confidence
-            <input
-              type="number"
-              step="0.01"
-              min="0.01"
-              max="0.9"
-              value={confidence}
-              onChange={(event) => setConfidence(Number(event.target.value))}
-            />
+            <input type="number" step="0.01" min="0.01" max="0.9" value={confidence} onChange={(event) => setConfidence(Number(event.target.value))} />
           </label>
           <label>
             OCR engine
@@ -453,11 +798,7 @@ export default function Home() {
             </select>
           </label>
           <label className="checkbox-row">
-            <input
-              type="checkbox"
-              checked={twoLineOcr}
-              onChange={(event) => setTwoLineOcr(event.target.checked)}
-            />
+            <input type="checkbox" checked={twoLineOcr} onChange={(event) => setTwoLineOcr(event.target.checked)} />
             Use two-line plate OCR crop
           </label>
           <button type="button" className="primary" disabled={!canRun} onClick={runDetectionAndOcr}>
@@ -472,10 +813,10 @@ export default function Home() {
       <section className="panel compare-panel">
         <div className="section-heading">
           <div>
-            <p className="eyebrow">Step 2</p>
+            <p className="eyebrow">Result view</p>
             <h2>Before and after</h2>
           </div>
-          <p className="muted no-margin">Left: original input. Right: Roboflow box + OCR.space plate text.</p>
+          <p className="muted no-margin">Left: input image. Right: detected plate + OCR text.</p>
         </div>
 
         <div className="compare-grid">
@@ -504,7 +845,7 @@ export default function Home() {
                 // eslint-disable-next-line @next/next/no-img-element
                 <img src={annotatedDataUrl} alt="Annotated output with license plate result" />
               ) : imageDataUrl ? (
-                <div className="placeholder">Click Detect + OCR to create the annotated result.</div>
+                <div className="placeholder">Click Detect + OCR or scan RFID to create result.</div>
               ) : (
                 <div className="placeholder">Result will appear here.</div>
               )}
@@ -516,10 +857,10 @@ export default function Home() {
       <section className="panel results-panel">
         <div className="section-heading">
           <div>
-            <p className="eyebrow">Step 3</p>
+            <p className="eyebrow">OCR output</p>
             <h2>Plate OCR results</h2>
           </div>
-          <p className="muted no-margin">Detected plate crop, final text, confidence, and OCR candidates.</p>
+          <p className="muted no-margin">Detected crop, final text, confidence, and OCR candidates.</p>
         </div>
 
         {detections.length === 0 && results.length === 0 ? (
@@ -537,6 +878,7 @@ export default function Home() {
                 <div>
                   <p className="result-title">Plate #{index + 1}</p>
                   <p className="plate-text">{item.text || "NO_TEXT"}</p>
+                  <p className="muted">Normalized: {normalizePlate(item.text)}</p>
                   <p className="muted">Detection confidence: {(item.detection.confidence * 100).toFixed(1)}%</p>
                   {item.candidates.length > 0 ? (
                     <details>
