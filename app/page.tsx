@@ -29,6 +29,7 @@ type PlateResult = {
 
 type Registry = Record<string, string>;
 type GateAction = "IN" | "OUT";
+type ImageInputMode = "none" | "upload" | "camera";
 
 type SerialPortLike = {
   readable: ReadableStream<Uint8Array> | null;
@@ -305,8 +306,13 @@ export default function Home() {
 
   const registryRef = useRef<Registry>(DEFAULT_REGISTRY);
 
+  const imageDataUrlRef = useRef("");
+  const imageInputModeRef = useRef<ImageInputMode>("none");
+
   const [cameraActive, setCameraActive] = useState(false);
   const [imageDataUrl, setImageDataUrl] = useState<string>("");
+  const [imageInputMode, setImageInputMode] = useState<ImageInputMode>("none");
+
   const [annotatedDataUrl, setAnnotatedDataUrl] = useState<string>("");
   const [detections, setDetections] = useState<PlateDetection[]>([]);
   const [results, setResults] = useState<PlateResult[]>([]);
@@ -342,6 +348,14 @@ export default function Home() {
   useEffect(() => {
     registryRef.current = registry;
   }, [registry]);
+
+  useEffect(() => {
+    imageDataUrlRef.current = imageDataUrl;
+  }, [imageDataUrl]);
+
+  useEffect(() => {
+    imageInputModeRef.current = imageInputMode;
+  }, [imageInputMode]);
 
   const stopCamera = useCallback(() => {
     if (streamRef.current) {
@@ -400,7 +414,7 @@ export default function Home() {
     const video = videoRef.current;
 
     if (!video || video.videoWidth === 0 || video.videoHeight === 0) {
-      throw new Error("Camera is not ready. Click Start webcam first.");
+      throw new Error("Camera is not ready. Click Start webcam first, or upload an image for upload-test mode.");
     }
 
     const canvas = document.createElement("canvas");
@@ -421,7 +435,11 @@ export default function Home() {
     try {
       const compressed = await captureFrameDataUrl();
 
+      imageDataUrlRef.current = compressed;
+      imageInputModeRef.current = "camera";
+
       setImageDataUrl(compressed);
+      setImageInputMode("camera");
       setAnnotatedDataUrl("");
       setDetections([]);
       setResults([]);
@@ -441,11 +459,19 @@ export default function Home() {
       const raw = await fileToDataUrl(file);
       const compressed = await compressForFreeApis(raw);
 
+      imageDataUrlRef.current = compressed;
+      imageInputModeRef.current = "upload";
+
       setImageDataUrl(compressed);
+      setImageInputMode("upload");
       setAnnotatedDataUrl("");
       setDetections([]);
       setResults([]);
-      setStatus(`Image ready (${Math.round(estimateDataUrlBytes(compressed) / 1024)} KB). Click Detect + OCR.`);
+      setStatus(
+        `Uploaded image ready (${Math.round(
+          estimateDataUrlBytes(compressed) / 1024
+        )} KB). Scan RFID to check this uploaded image, or click Detect + OCR.`
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load image.");
     }
@@ -454,7 +480,8 @@ export default function Home() {
   async function detectPlatesFromImage(inputImageDataUrl: string, maxResults = 3): Promise<PlateResult[]> {
     const apiImage = await compressForFreeApis(inputImageDataUrl);
 
-    if (apiImage !== imageDataUrl) {
+    if (apiImage !== imageDataUrlRef.current) {
+      imageDataUrlRef.current = apiImage;
       setImageDataUrl(apiImage);
     }
 
@@ -575,7 +602,7 @@ export default function Home() {
       writerRef.current = port.writable.getWriter();
 
       setSerialConnected(true);
-      setStatus("Arduino connected. Start webcam, then scan RFID.");
+      setStatus("Arduino connected. Start webcam, or upload a test image, then scan RFID.");
 
       void readArduinoLoop(port);
     } catch (err) {
@@ -725,12 +752,29 @@ export default function Home() {
     setResults([]);
 
     try {
-      setStatus(`RFID ${uid} detected. Capturing webcam image...`);
+      let checkImageDataUrl = "";
 
-      const captured = await captureFrameDataUrl();
-      setImageDataUrl(captured);
+      const hasUploadedImage =
+        imageInputModeRef.current === "upload" && imageDataUrlRef.current.length > 0;
 
-      const plateResults = await detectPlatesFromImage(captured, 1);
+      if (hasUploadedImage) {
+        setStatus(`RFID ${uid} detected. Using uploaded image for AI check...`);
+        checkImageDataUrl = imageDataUrlRef.current;
+      } else {
+        setStatus(`RFID ${uid} detected. Capturing webcam image...`);
+
+        const captured = await captureFrameDataUrl();
+
+        imageDataUrlRef.current = captured;
+        imageInputModeRef.current = "camera";
+
+        setImageDataUrl(captured);
+        setImageInputMode("camera");
+
+        checkImageDataUrl = captured;
+      }
+
+      const plateResults = await detectPlatesFromImage(checkImageDataUrl, 1);
 
       if (plateResults.length === 0) {
         await sendToArduino(`DENY,${uid},NO_PLATE`);
@@ -746,13 +790,29 @@ export default function Home() {
         const command = action === "IN" ? "OPEN_IN" : "OPEN_OUT";
         await sendToArduino(`${command},${uid},${normalizePlate(detectedPlate) || detectedPlate}`);
 
-        setLastDecision(`OPEN_${action}: UID=${uid}. Saved=${savedPlate}. Detected=${detectedPlate}.`);
-        setStatus(`Access accepted. Saved=${savedPlate}, Detected=${detectedPlate}.`);
+        if (hasUploadedImage) {
+          setLastDecision(
+            `OPEN_${action}: UID=${uid}. Saved=${savedPlate}. Detected=${detectedPlate}. Source=uploaded image.`
+          );
+          setStatus(`Access accepted using uploaded image. Saved=${savedPlate}, Detected=${detectedPlate}.`);
+        } else {
+          setLastDecision(
+            `OPEN_${action}: UID=${uid}. Saved=${savedPlate}. Detected=${detectedPlate}. Source=webcam.`
+          );
+          setStatus(`Access accepted using webcam. Saved=${savedPlate}, Detected=${detectedPlate}.`);
+        }
       } else {
         await sendToArduino(`DENY,${uid},WRONG_PLATE`);
 
-        setLastDecision(`DENY: UID=${uid}. Saved=${savedPlate}. Detected=${detectedPlate}.`);
-        setStatus(`Access denied. Saved=${savedPlate}, Detected=${detectedPlate}.`);
+        if (hasUploadedImage) {
+          setLastDecision(
+            `DENY: UID=${uid}. Saved=${savedPlate}. Detected=${detectedPlate}. Source=uploaded image.`
+          );
+          setStatus(`Access denied using uploaded image. Saved=${savedPlate}, Detected=${detectedPlate}.`);
+        } else {
+          setLastDecision(`DENY: UID=${uid}. Saved=${savedPlate}. Detected=${detectedPlate}. Source=webcam.`);
+          setStatus(`Access denied using webcam. Saved=${savedPlate}, Detected=${detectedPlate}.`);
+        }
       }
     } catch (err) {
       try {
@@ -761,7 +821,7 @@ export default function Home() {
         // Ignore nested serial errors.
       }
 
-      setLastDecision(`DENY: UID=${uid}. AI/webcam error.`);
+      setLastDecision(`DENY: UID=${uid}. AI/webcam/upload-image error.`);
       setError(err instanceof Error ? err.message : "AI check failed.");
     } finally {
       setBusy(false);
@@ -902,6 +962,11 @@ export default function Home() {
               <strong>Saved plate:</strong> {savedPlateForPendingUid || "None"}
             </p>
 
+            <p>
+              <strong>Image source:</strong>{" "}
+              {imageInputMode === "upload" ? "Uploaded image" : imageInputMode === "camera" ? "Camera" : "None"}
+            </p>
+
             <p className="decision-text">{lastDecision}</p>
 
             <div className="manual-controls">
@@ -961,14 +1026,16 @@ export default function Home() {
             <h2>Webcam or manual image test</h2>
           </div>
 
-          <p className="muted no-margin">For gate mode, start webcam first, then scan RFID.</p>
+          <p className="muted no-margin">
+            Upload mode: scan RFID to check uploaded image. Camera mode: scan RFID to capture webcam.
+          </p>
         </div>
 
         <div className="input-options">
           <label className="file-box input-card">
             <input type="file" accept="image/*" onChange={(event) => handleFile(event.target.files?.[0] ?? null)} />
             <span>Upload image</span>
-            <small>Manual testing only. JPG / PNG / WebP.</small>
+            <small>Manual testing only. If RFID is scanned, this uploaded image will be checked.</small>
           </label>
 
           <div className="camera-box input-card">
