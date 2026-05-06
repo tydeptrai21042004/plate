@@ -270,7 +270,6 @@ function isPlateMatch(detectedPlate: string, savedPlate: string): boolean {
 
   if (!detected || !saved) return false;
 
-  // Test mode: saved short prefixes like 30F, 55F, 75.
   if (saved.length <= 3) return detected.startsWith(saved);
 
   return detected === saved;
@@ -345,8 +344,11 @@ export default function Home() {
   }, [registry]);
 
   const stopCamera = useCallback(() => {
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+
     setCameraActive(false);
   }, []);
 
@@ -355,12 +357,7 @@ export default function Home() {
       stopCamera();
 
       try {
-.current = null;
-    setCameraActive(false);
-  }, []);
-
-  useEffect(() => {
-    return        readerRef.current?.cancel();
+        readerRef.current?.cancel();
       } catch {
         // Ignore cleanup errors.
       }
@@ -910,9 +907,7 @@ export default function Home() {
             <div className="manual-controls">
               <h4>Manual open gate</h4>
 
-              <p className="muted">
-                Use this only for testing or emergency. It bypasses RFID and plate checking.
-              </p>
+              <p className="muted">Use this only for testing or emergency. It bypasses RFID and plate checking.</p>
 
               <div className="button-row">
                 <button
