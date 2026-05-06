@@ -1,7 +1,7 @@
 #include <SPI.h>
-#include <MFRC522.h>
+#include "MFRC522.h"
 #include <Wire.h>
-#include <LiquidCrystal_I2C.h>
+#include "LiquidCrystal_I2C.h"
 #include <Servo.h>
 
 #define SS_PIN 10
@@ -56,6 +56,7 @@ void removeUID(int index) {
   for (int i = index; i < uidCount - 1; i++) {
     uidList[i] = uidList[i + 1];
   }
+
   uidCount--;
 }
 
@@ -99,6 +100,7 @@ void showHome() {
   lcd.clear();
   lcd.setCursor(2, 0);
   lcd.print("Parking Area");
+
   lcd.setCursor(0, 1);
   lcd.print("Slot:");
 }
@@ -119,18 +121,21 @@ void updateSlots() {
 
 void showWaitingAI() {
   lcd.clear();
+
   lcd.setCursor(0, 0);
   lcd.print("RFID scanned");
+
   lcd.setCursor(0, 1);
   lcd.print("Wait AI check");
 }
 
 void showPlate(String title, String plate) {
   lcd.clear();
+
   lcd.setCursor(0, 0);
   lcd.print(title);
-  lcd.setCursor(0, 1);
 
+  lcd.setCursor(0, 1);
   if (plate.length() > 16) {
     lcd.print(plate.substring(0, 16));
   } else {
@@ -140,10 +145,11 @@ void showPlate(String title, String plate) {
 
 void showDenied(String reason) {
   lcd.clear();
+
   lcd.setCursor(0, 0);
   lcd.print("ACCESS DENIED");
-  lcd.setCursor(0, 1);
 
+  lcd.setCursor(0, 1);
   if (reason.length() > 16) {
     lcd.print(reason.substring(0, 16));
   } else {
@@ -156,6 +162,7 @@ void showDenied(String reason) {
 
 // =====================================================
 // SERIAL PROTOCOL
+//
 // Arduino sends to web browser:
 //   RFID,IN,UID
 //   RFID,OUT,UID
@@ -164,6 +171,8 @@ void showDenied(String reason) {
 //   OPEN_IN,UID,PLATE
 //   OPEN_OUT,UID,PLATE
 //   DENY,UID,REASON
+//   MANUAL_IN,MANUAL,NOTE
+//   MANUAL_OUT,MANUAL,NOTE
 // =====================================================
 
 String getCsvField(String line, int index) {
@@ -175,6 +184,7 @@ String getCsvField(String line, int index) {
       if (current == index) {
         return line.substring(start, i);
       }
+
       current++;
       start = i + 1;
     }
@@ -190,14 +200,48 @@ void clearPending() {
 
 void processCommand(String line) {
   line.trim();
+
   if (line.length() == 0) return;
 
   String cmd = getCsvField(line, 0);
   String uid = getCsvField(line, 1);
   String value = getCsvField(line, 2);
 
+  cmd.trim();
   uid.trim();
   value.trim();
+
+  // =====================================================
+  // MANUAL OVERRIDE COMMANDS
+  // These do NOT need RFID pendingUID.
+  // These do NOT add/remove uidList.
+  // =====================================================
+
+  if (cmd == "MANUAL_IN") {
+    showPlate("MANUAL VAO", value.length() > 0 ? value : "OPEN");
+    openGateIn();
+
+    clearPending();
+    showHome();
+
+    Serial.println("DONE,MANUAL_IN");
+    return;
+  }
+
+  if (cmd == "MANUAL_OUT") {
+    showPlate("MANUAL RA", value.length() > 0 ? value : "OPEN");
+    openGateOut();
+
+    clearPending();
+    showHome();
+
+    Serial.println("DONE,MANUAL_OUT");
+    return;
+  }
+
+  // =====================================================
+  // NORMAL RFID + AI COMMANDS
+  // =====================================================
 
   if (pendingUID.length() > 0 && uid != pendingUID) {
     Serial.println("ERROR,UID_MISMATCH");
@@ -206,10 +250,13 @@ void processCommand(String line) {
 
   if (cmd == "OPEN_IN") {
     addUID(uid);
+
     showPlate("VAO OK", value);
     openGateIn();
+
     clearPending();
     showHome();
+
     Serial.println("DONE,OPEN_IN");
   }
 
@@ -221,14 +268,18 @@ void processCommand(String line) {
 
     showPlate("RA OK", value);
     openGateOut();
+
     clearPending();
     showHome();
+
     Serial.println("DONE,OPEN_OUT");
   }
 
   else if (cmd == "DENY") {
     showDenied(value.length() > 0 ? value : "WRONG PLATE");
+
     clearPending();
+
     Serial.println("DONE,DENY");
   }
 
@@ -245,7 +296,9 @@ void readSerialCommands() {
     if (c == '\n') {
       processCommand(serialBuffer);
       serialBuffer = "";
-    } else if (c != '\r') {
+    }
+
+    else if (c != '\r') {
       serialBuffer += c;
 
       if (serialBuffer.length() > 120) {
@@ -265,6 +318,8 @@ void setup() {
   SPI.begin();
   mfrc522.PCD_Init();
 
+  // If this gives compile error in your LCD library,
+  // change lcd.init(); to lcd.begin();
   lcd.init();
   lcd.backlight();
 
@@ -280,6 +335,7 @@ void setup() {
   pinMode(odo4, INPUT_PULLUP);
 
   showHome();
+
   Serial.println("ARDUINO_READY");
 }
 
@@ -299,6 +355,7 @@ void loop() {
       lastScanTime = millis();
 
       int index = findUID(uid);
+
       pendingAction = (index == -1) ? "IN" : "OUT";
       pendingUID = uid;
 
