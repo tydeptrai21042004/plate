@@ -5,7 +5,7 @@ Next.js app for API-based license plate recognition:
 - Roboflow Workflow API for license-plate detection
 - OCR.space API for plate OCR
 - Image upload input
-- Webcam capture input
+- Two-camera webcam capture input for IN/OUT gate routing
 - Before / After side-by-side result
 - No local `.pt` model weight
 
@@ -61,6 +61,22 @@ Open:
 ```text
 http://localhost:3000
 ```
+
+## Two-camera gate mode
+
+The Arduino code does not need to change. The browser reads the existing serial messages:
+
+```text
+RFID,IN,UID
+RFID,OUT,UID
+```
+
+Then it captures from the matching camera:
+
+- `RFID,IN,UID` → capture **IN camera / entrance** → send `OPEN_IN` or `DENY`.
+- `RFID,OUT,UID` → capture **OUT camera / exit** → send `OPEN_OUT` or `DENY`.
+
+Use **Refresh camera list**, choose a camera for each gate, then click **Start both cameras** before scanning RFID.
 
 ## Example `.env.local`
 

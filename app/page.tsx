@@ -29,7 +29,7 @@ type PlateResult = {
 
 type Registry = Record<string, string>;
 type GateAction = "IN" | "OUT";
-type ImageInputMode = "none" | "upload" | "camera";
+type ImageInputMode = "none" | "upload" | "camera-in" | "camera-out";
 
 type SerialPortLike = {
   readable: ReadableStream<Uint8Array> | null;
@@ -296,9 +296,18 @@ function saveRegistryToStorage(registry: Registry) {
   window.localStorage.setItem(REGISTRY_KEY, JSON.stringify(registry, null, 2));
 }
 
+function imageInputModeLabel(mode: ImageInputMode): string {
+  if (mode === "upload") return "Uploaded image";
+  if (mode === "camera-in") return "IN camera";
+  if (mode === "camera-out") return "OUT camera";
+  return "None";
+}
+
 export default function Home() {
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  const inVideoRef = useRef<HTMLVideoElement | null>(null);
+  const outVideoRef = useRef<HTMLVideoElement | null>(null);
+  const inStreamRef = useRef<MediaStream | null>(null);
+  const outStreamRef = useRef<MediaStream | null>(null);
 
   const portRef = useRef<SerialPortLike | null>(null);
   const writerRef = useRef<WritableStreamDefaultWriter<Uint8Array> | null>(null);
@@ -309,7 +318,10 @@ export default function Home() {
   const imageDataUrlRef = useRef("");
   const imageInputModeRef = useRef<ImageInputMode>("none");
 
-  const [cameraActive, setCameraActive] = useState(false);
+  const [cameraList, setCameraList] = useState<MediaDeviceInfo[]>([]);
+  const [inCameraDeviceId, setInCameraDeviceId] = useState("");
+  const [outCameraDeviceId, setOutCameraDeviceId] = useState("");
+  const [cameraActive, setCameraActive] = useState<Record<GateAction, boolean>>({ IN: false, OUT: false });
   const [imageDataUrl, setImageDataUrl] = useState<string>("");
   const [imageInputMode, setImageInputMode] = useState<ImageInputMode>("none");
 
@@ -357,18 +369,49 @@ export default function Home() {
     imageInputModeRef.current = imageInputMode;
   }, [imageInputMode]);
 
-  const stopCamera = useCallback(() => {
+  const refreshCameraList = useCallback(async (): Promise<MediaDeviceInfo[]> => {
+    if (!navigator.mediaDevices?.enumerateDevices) {
+      return [];
+    }
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cameras = devices.filter((device) => device.kind === "videoinput");
+
+    setCameraList(cameras);
+    setInCameraDeviceId((current) => current || cameras[0]?.deviceId || "");
+    setOutCameraDeviceId((current) => current || cameras[1]?.deviceId || cameras[0]?.deviceId || "");
+
+    return cameras;
+  }, []);
+
+  const stopGateCamera = useCallback((action: GateAction) => {
+    const streamRef = action === "IN" ? inStreamRef : outStreamRef;
+
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
 
-    setCameraActive(false);
+    const video = action === "IN" ? inVideoRef.current : outVideoRef.current;
+    if (video) {
+      video.srcObject = null;
+    }
+
+    setCameraActive((current) => ({ ...current, [action]: false }));
   }, []);
+
+  const stopAllCameras = useCallback(() => {
+    stopGateCamera("IN");
+    stopGateCamera("OUT");
+  }, [stopGateCamera]);
+
+  useEffect(() => {
+    void refreshCameraList();
+  }, [refreshCameraList]);
 
   useEffect(() => {
     return () => {
-      stopCamera();
+      stopAllCameras();
 
       try {
         readerRef.current?.cancel();
@@ -382,39 +425,106 @@ export default function Home() {
         // Ignore cleanup errors.
       }
     };
-  }, [stopCamera]);
+  }, [stopAllCameras]);
 
-  async function startCamera() {
+  function getSelectedCameraDeviceId(action: GateAction, cameras = cameraList): string {
+    const selected = action === "IN" ? inCameraDeviceId : outCameraDeviceId;
+
+    if (selected) return selected;
+    if (action === "IN") return cameras[0]?.deviceId || "";
+
+    return cameras.find((camera) => camera.deviceId && camera.deviceId !== inCameraDeviceId)?.deviceId || cameras[0]?.deviceId || "";
+  }
+
+  async function startGateCamera(action: GateAction, requestedDeviceId?: string) {
     setError("");
 
     try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("Camera access is not available in this browser.");
+      }
+
+      const cameras = await refreshCameraList();
+      const deviceId = requestedDeviceId ?? getSelectedCameraDeviceId(action, cameras);
+
+      stopGateCamera(action);
+
+      const videoConstraints: MediaTrackConstraints = {
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      };
+
+      if (deviceId) {
+        videoConstraints.deviceId = { exact: deviceId };
+      } else {
+        videoConstraints.facingMode = { ideal: "environment" };
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: { ideal: "environment" },
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
-        },
+        video: videoConstraints,
         audio: false
       });
 
+      const video = action === "IN" ? inVideoRef.current : outVideoRef.current;
+      const streamRef = action === "IN" ? inStreamRef : outStreamRef;
+
       streamRef.current = stream;
 
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
+      if (video) {
+        video.srcObject = stream;
+        await video.play().catch(() => undefined);
       }
 
-      setCameraActive(true);
-      setStatus("Webcam started. Now connect Arduino and scan RFID.");
+      setCameraActive((current) => ({ ...current, [action]: true }));
+      setStatus(`${action} camera started. Arduino RFID ${action} scans will use this camera.`);
+
+      void refreshCameraList();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not start camera.");
+      setError(err instanceof Error ? err.message : `Could not start ${action} camera.`);
     }
   }
 
-  async function captureFrameDataUrl(): Promise<string> {
-    const video = videoRef.current;
+  async function startBothCameras() {
+    setError("");
+
+    try {
+      const cameras = await refreshCameraList();
+      const selectedIn = inCameraDeviceId || cameras[0]?.deviceId || "";
+      const selectedOut =
+        outCameraDeviceId ||
+        cameras.find((camera) => camera.deviceId && camera.deviceId !== selectedIn)?.deviceId ||
+        selectedIn;
+
+      if (cameras.length < 2) {
+        setStatus("Only one camera was found. You can still test, but IN and OUT may use the same camera.");
+      }
+
+      await startGateCamera("IN", selectedIn);
+      await startGateCamera("OUT", selectedOut);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not start both cameras.");
+    }
+  }
+
+  function handleCameraSelect(action: GateAction, deviceId: string) {
+    if (action === "IN") {
+      setInCameraDeviceId(deviceId);
+    } else {
+      setOutCameraDeviceId(deviceId);
+    }
+
+    if (cameraActive[action]) {
+      stopGateCamera(action);
+      setStatus(`${action} camera changed. Start it again to use the new device.`);
+    }
+  }
+
+  async function captureGateFrameDataUrl(action: GateAction): Promise<string> {
+    const video = action === "IN" ? inVideoRef.current : outVideoRef.current;
+    const sourceLabel = action === "IN" ? "IN camera" : "OUT camera";
 
     if (!video || video.videoWidth === 0 || video.videoHeight === 0) {
-      throw new Error("Camera is not ready. Click Start webcam first, or upload an image for upload-test mode.");
+      throw new Error(`${sourceLabel} is not ready. Start the ${sourceLabel} first.`);
     }
 
     const canvas = document.createElement("canvas");
@@ -422,30 +532,33 @@ export default function Home() {
     canvas.height = video.videoHeight;
 
     const ctx = canvas.getContext("2d");
-    if (!ctx) throw new Error("Could not capture camera frame.");
+    if (!ctx) throw new Error(`Could not capture ${sourceLabel} frame.`);
 
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
     return compressForFreeApis(canvas.toDataURL("image/jpeg", 0.9));
   }
 
-  async function captureFromCamera() {
+  async function captureFromGateCamera(action: GateAction) {
     setError("");
 
     try {
-      const compressed = await captureFrameDataUrl();
+      const compressed = await captureGateFrameDataUrl(action);
+      const mode: ImageInputMode = action === "IN" ? "camera-in" : "camera-out";
 
       imageDataUrlRef.current = compressed;
-      imageInputModeRef.current = "camera";
+      imageInputModeRef.current = mode;
 
       setImageDataUrl(compressed);
-      setImageInputMode("camera");
+      setImageInputMode(mode);
       setAnnotatedDataUrl("");
       setDetections([]);
       setResults([]);
-      setStatus(`Captured camera image (${Math.round(estimateDataUrlBytes(compressed) / 1024)} KB). Click Detect + OCR.`);
+      setStatus(
+        `Captured ${action} camera image (${Math.round(estimateDataUrlBytes(compressed) / 1024)} KB). Click Detect + OCR.`
+      );
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not capture camera frame.");
+      setError(err instanceof Error ? err.message : `Could not capture ${action} camera frame.`);
     }
   }
 
@@ -470,7 +583,7 @@ export default function Home() {
       setStatus(
         `Uploaded image ready (${Math.round(
           estimateDataUrlBytes(compressed) / 1024
-        )} KB). Scan RFID to check this uploaded image, or click Detect + OCR.`
+        )} KB). Click Detect + OCR for manual testing. RFID scans use the matching IN/OUT camera.`
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load image.");
@@ -602,7 +715,7 @@ export default function Home() {
       writerRef.current = port.writable.getWriter();
 
       setSerialConnected(true);
-      setStatus("Arduino connected. Start webcam, or upload a test image, then scan RFID.");
+      setStatus("Arduino connected. Start both IN/OUT cameras, then scan RFID.");
 
       void readArduinoLoop(port);
     } catch (err) {
@@ -752,29 +865,20 @@ export default function Home() {
     setResults([]);
 
     try {
-      let checkImageDataUrl = "";
+      const sourceLabel = action === "IN" ? "IN camera" : "OUT camera";
+      const mode: ImageInputMode = action === "IN" ? "camera-in" : "camera-out";
 
-      const hasUploadedImage =
-        imageInputModeRef.current === "upload" && imageDataUrlRef.current.length > 0;
+      setStatus(`RFID ${uid} (${action}) detected. Capturing ${sourceLabel} image...`);
 
-      if (hasUploadedImage) {
-        setStatus(`RFID ${uid} detected. Using uploaded image for AI check...`);
-        checkImageDataUrl = imageDataUrlRef.current;
-      } else {
-        setStatus(`RFID ${uid} detected. Capturing webcam image...`);
+      const captured = await captureGateFrameDataUrl(action);
 
-        const captured = await captureFrameDataUrl();
+      imageDataUrlRef.current = captured;
+      imageInputModeRef.current = mode;
 
-        imageDataUrlRef.current = captured;
-        imageInputModeRef.current = "camera";
+      setImageDataUrl(captured);
+      setImageInputMode(mode);
 
-        setImageDataUrl(captured);
-        setImageInputMode("camera");
-
-        checkImageDataUrl = captured;
-      }
-
-      const plateResults = await detectPlatesFromImage(checkImageDataUrl, 1);
+      const plateResults = await detectPlatesFromImage(captured, 1);
 
       if (plateResults.length === 0) {
         await sendToArduino(`DENY,${uid},NO_PLATE`);
@@ -790,29 +894,15 @@ export default function Home() {
         const command = action === "IN" ? "OPEN_IN" : "OPEN_OUT";
         await sendToArduino(`${command},${uid},${normalizePlate(detectedPlate) || detectedPlate}`);
 
-        if (hasUploadedImage) {
-          setLastDecision(
-            `OPEN_${action}: UID=${uid}. Saved=${savedPlate}. Detected=${detectedPlate}. Source=uploaded image.`
-          );
-          setStatus(`Access accepted using uploaded image. Saved=${savedPlate}, Detected=${detectedPlate}.`);
-        } else {
-          setLastDecision(
-            `OPEN_${action}: UID=${uid}. Saved=${savedPlate}. Detected=${detectedPlate}. Source=webcam.`
-          );
-          setStatus(`Access accepted using webcam. Saved=${savedPlate}, Detected=${detectedPlate}.`);
-        }
+        setLastDecision(
+          `OPEN_${action}: UID=${uid}. Saved=${savedPlate}. Detected=${detectedPlate}. Source=${sourceLabel}.`
+        );
+        setStatus(`Access accepted using ${sourceLabel}. Saved=${savedPlate}, Detected=${detectedPlate}.`);
       } else {
         await sendToArduino(`DENY,${uid},WRONG_PLATE`);
 
-        if (hasUploadedImage) {
-          setLastDecision(
-            `DENY: UID=${uid}. Saved=${savedPlate}. Detected=${detectedPlate}. Source=uploaded image.`
-          );
-          setStatus(`Access denied using uploaded image. Saved=${savedPlate}, Detected=${detectedPlate}.`);
-        } else {
-          setLastDecision(`DENY: UID=${uid}. Saved=${savedPlate}. Detected=${detectedPlate}. Source=webcam.`);
-          setStatus(`Access denied using webcam. Saved=${savedPlate}, Detected=${detectedPlate}.`);
-        }
+        setLastDecision(`DENY: UID=${uid}. Saved=${savedPlate}. Detected=${detectedPlate}. Source=${sourceLabel}.`);
+        setStatus(`Access denied using ${sourceLabel}. Saved=${savedPlate}, Detected=${detectedPlate}.`);
       }
     } catch (err) {
       try {
@@ -821,7 +911,7 @@ export default function Home() {
         // Ignore nested serial errors.
       }
 
-      setLastDecision(`DENY: UID=${uid}. AI/webcam/upload-image error.`);
+      setLastDecision(`DENY: UID=${uid}. AI or ${action} camera error.`);
       setError(err instanceof Error ? err.message : "AI check failed.");
     } finally {
       setBusy(false);
@@ -870,6 +960,56 @@ export default function Home() {
     setStatus(`Removed UID ${normalizedUid}.`);
   }
 
+  function renderGateCameraCard(action: GateAction) {
+    const active = cameraActive[action];
+    const selectedDeviceId = action === "IN" ? inCameraDeviceId : outCameraDeviceId;
+    const videoRef = action === "IN" ? inVideoRef : outVideoRef;
+    const title = action === "IN" ? "IN camera / entrance" : "OUT camera / exit";
+
+    return (
+      <article className="camera-box input-card gate-camera-card" key={action}>
+        <div className="camera-card-head">
+          <div>
+            <p className="eyebrow">{action} gate</p>
+            <h3>{title}</h3>
+          </div>
+          <span className={active ? "camera-pill active" : "camera-pill"}>{active ? "Live" : "Off"}</span>
+        </div>
+
+        <label className="camera-select-label">
+          Camera device
+          <select value={selectedDeviceId} onChange={(event) => handleCameraSelect(action, event.target.value)}>
+            <option value="">Auto/default camera</option>
+            {cameraList.map((camera, index) => (
+              <option value={camera.deviceId} key={camera.deviceId || index}>
+                {camera.label || `Camera ${index + 1}`}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <div className="camera-preview">
+          <video ref={videoRef} autoPlay playsInline muted className={active ? "video active" : "video"} />
+          {!active ? <div className="camera-placeholder">{action} camera preview</div> : null}
+        </div>
+
+        <div className="button-row camera-button-row">
+          <button type="button" onClick={() => startGateCamera(action)} disabled={busy}>
+            {active ? "Restart" : "Start"}
+          </button>
+
+          <button type="button" className="secondary" onClick={() => captureFromGateCamera(action)} disabled={!active || busy}>
+            Capture
+          </button>
+
+          <button type="button" className="secondary" onClick={() => stopGateCamera(action)} disabled={!active || busy}>
+            Stop
+          </button>
+        </div>
+      </article>
+    );
+  }
+
   return (
     <main className="page-shell">
       <section className="hero-card">
@@ -877,7 +1017,7 @@ export default function Home() {
           <p className="eyebrow">Arduino RFID + Webcam AI</p>
           <h1>Parking Gate Plate Checker</h1>
           <p className="hero-text">
-            Scan an RFID card, capture the webcam image, detect the plate, compare it with the saved plate for that UID,
+            Scan an RFID card, capture from the matching IN/OUT camera, detect the plate, compare it with the saved plate for that UID,
             then send OPEN or DENY back to Arduino.
           </p>
         </div>
@@ -963,8 +1103,7 @@ export default function Home() {
             </p>
 
             <p>
-              <strong>Image source:</strong>{" "}
-              {imageInputMode === "upload" ? "Uploaded image" : imageInputMode === "camera" ? "Camera" : "None"}
+              <strong>Image source:</strong> {imageInputModeLabel(imageInputMode)}
             </p>
 
             <p className="decision-text">{lastDecision}</p>
@@ -1023,45 +1162,36 @@ export default function Home() {
         <div className="section-heading">
           <div>
             <p className="eyebrow">Image input</p>
-            <h2>Webcam or manual image test</h2>
+            <h2>Two-camera gate capture</h2>
           </div>
 
           <p className="muted no-margin">
-            Upload mode: scan RFID to check uploaded image. Camera mode: scan RFID to capture webcam.
+            RFID IN uses the IN camera. RFID OUT uses the OUT camera. Upload mode is only for manual testing.
           </p>
         </div>
 
-        <div className="input-options">
+        <div className="dual-camera-toolbar">
+          <button type="button" className="secondary" onClick={() => void refreshCameraList()} disabled={busy}>
+            Refresh camera list
+          </button>
+
+          <button type="button" onClick={startBothCameras} disabled={busy}>
+            Start both cameras
+          </button>
+
+          <button type="button" className="secondary" onClick={stopAllCameras} disabled={busy}>
+            Stop both cameras
+          </button>
+        </div>
+
+        <div className="dual-camera-grid">{(["IN", "OUT"] as GateAction[]).map(renderGateCameraCard)}</div>
+
+        <div className="upload-test-wrap">
           <label className="file-box input-card">
             <input type="file" accept="image/*" onChange={(event) => handleFile(event.target.files?.[0] ?? null)} />
             <span>Upload image</span>
-            <small>Manual testing only. If RFID is scanned, this uploaded image will be checked.</small>
+            <small>Manual testing only. RFID scans always capture from the matching IN/OUT camera.</small>
           </label>
-
-          <div className="camera-box input-card">
-            <div className="camera-preview">
-              <video ref={videoRef} autoPlay playsInline muted className={cameraActive ? "video active" : "video"} />
-              {!cameraActive ? <div className="camera-placeholder">Webcam preview appears here</div> : null}
-            </div>
-
-            <div className="button-row">
-              {!cameraActive ? (
-                <button type="button" onClick={startCamera}>
-                  Start webcam
-                </button>
-              ) : (
-                <>
-                  <button type="button" onClick={captureFromCamera}>
-                    Capture
-                  </button>
-
-                  <button type="button" className="secondary" onClick={stopCamera}>
-                    Stop
-                  </button>
-                </>
-              )}
-            </div>
-          </div>
         </div>
 
         <div className="settings action-settings">
@@ -1120,9 +1250,9 @@ export default function Home() {
             <div className="image-stage">
               {imageDataUrl ? (
                 // eslint-disable-next-line @next/next/no-img-element
-                <img src={imageDataUrl} alt="Original uploaded or webcam input" />
+                <img src={imageDataUrl} alt="Original uploaded or gate camera input" />
               ) : (
-                <div className="placeholder">Upload an image or capture from webcam.</div>
+                <div className="placeholder">Upload an image or capture from one of the gate cameras.</div>
               )}
             </div>
           </article>
